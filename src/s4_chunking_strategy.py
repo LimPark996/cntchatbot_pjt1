@@ -97,7 +97,7 @@ class ChunkingStrategy:
         
         return chunks
     
-    def chunk_pages(self, text_blocks: List[Dict], institution: str) -> List[Dict]:
+    def chunk_pages(self, text_blocks: List[Dict], institution: str, source_pdf: str) -> List[Dict]:
         """
         페이지를 토큰 기반으로 청킹
         
@@ -110,6 +110,7 @@ class ChunkingStrategy:
         Args:
             text_blocks: 텍스트 블록 리스트 (각 블록은 {"text": "...", "page_num": 1} 형태)
             institution: 기관 코드 (hd, kb, khi)
+            source_pdf: PDF 파일명
         
         Returns:
             청크 리스트 (각 청크는 chunk_id, content, metadata 포함)
@@ -138,13 +139,14 @@ class ChunkingStrategy:
             # 각 청크에 메타데이터 추가
             for chunk_text in text_chunks:
                 all_chunks.append({
-                    "chunk_id": f"chunk_{chunk_counter:04d}",  # chunk_0001, chunk_0002, ...
+                    "chunk_id": f"chunk_{chunk_counter:04d}",
                     "content": chunk_text,
                     "metadata": {
-                        "institution": institution,  # 출처 기관
-                        "doc_type": "text",  # 텍스트 청크임을 표시
-                        "page": page_num,  # 원본 페이지 번호
-                        "chunk_tokens": self.count_tokens(chunk_text)  # 청크의 토큰 수
+                        "institution": institution,
+                        "source_pdf": source_pdf,
+                        "doc_type": "text",
+                        "page": page_num,
+                        "chunk_tokens": self.count_tokens(chunk_text)
                     }
                 })
                 chunk_counter += 1
@@ -175,9 +177,10 @@ class ChunkingStrategy:
             "content": table_content,
             "metadata": {
                 "institution": table_data.get("institution", "unknown"),
-                "doc_type": "table",  # 표 청크임을 표시
+                "source_pdf": table_data.get("source_pdf", "unknown"),
+                "doc_type": "table",
                 "table_id": table_data["table_id"],
-
+                "caption": caption,
                 "page": table_data.get("page_num", 0),
                 "chunk_tokens": self.count_tokens(table_content)
             }
@@ -209,6 +212,11 @@ class ChunkingStrategy:
         # 이미지 파일명에서 식별자 추출 (예: image_01.png -> image_01_png)
         image_path = image_data.get("image_path", "")
         image_filename = image_data.get("image_filename", "")
+        
+        # image_filename이 없으면 image_path에서 추출
+        if not image_filename and image_path:
+            image_filename = os.path.basename(image_path)
+        
         image_id = image_filename.replace(".", "_") if image_filename else "unknown"
         
         # 이미지 청크 생성 (doc_type="image"로 구분)
@@ -217,8 +225,9 @@ class ChunkingStrategy:
             "content": chunk_content,
             "metadata": {
                 "institution": image_data.get("institution", "unknown"),
-                "doc_type": "image",  # 이미지 청크임을 표시
-                "image_path": image_path,  # 원본 이미지 경로 보존
+                "source_pdf": image_data.get("source_pdf", "unknown"),
+                "doc_type": "image",
+                "image_path": image_path,
                 "caption": caption,
                 "page": image_data.get("page_num", 0),
                 "chunk_tokens": self.count_tokens(chunk_content)
@@ -294,7 +303,7 @@ class ChunkingStrategy:
         
         Args:
             json_path: processed.json 파일 경로
-                      (예: data/processed/hd/hd_report_processed.json)
+                      (예: data/processed/kb/kb_report_processed.json)
         
         Returns:
             청크 리스트
@@ -306,11 +315,13 @@ class ChunkingStrategy:
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        # 기관 정보 추출 (JSON 구조에 따라 다른 위치에서 추출 시도)
-        institution = data["institution"]
+        # 기관 정보 및 PDF 파일명 추출
+        institution = data.get("institution", "unknown")
+        source_pdf = data.get("source_pdf", f"{institution}_report.pdf")
         
         print(f"✓ JSON 로드 완료: {json_path}")
         print(f"✓ 기관: {institution.upper()}")
+        print(f"✓ 출처 PDF: {source_pdf}")
         
         # 텍스트 블록 수집 (모든 페이지의 text_blocks 수집)
         text_blocks = []
@@ -320,12 +331,28 @@ class ChunkingStrategy:
         # 표 데이터 수집 (모든 페이지의 tables 수집)
         tables = []
         for page_data in data.get("tables", []):
-            tables.extend(page_data.get("content", []))
+            for table in page_data.get("content", []):
+                # 표에 institution과 source_pdf 추가
+                table["institution"] = institution
+                table["source_pdf"] = source_pdf
+                tables.append(table)
         
         # 이미지 데이터 수집 (모든 페이지의 images 수집)
         images = []
         for page_data in data.get("images", []):
-            images.extend(page_data.get("description", []))
+            page_num = page_data.get("page", 0)
+            
+            for img in page_data.get("description", []):
+                # page_num이 없거나 0이면 page_data의 page 사용
+                if "page_num" not in img or img.get("page_num") == 0:
+                    img["page_num"] = page_num
+                
+                # 각 이미지마다 institution과 source_pdf 추가
+                img["institution"] = institution
+                img["source_pdf"] = source_pdf
+                
+                # 각 이미지를 리스트에 추가
+                images.append(img)
         
         print(f"  - 텍스트 블록: {len(text_blocks)}개")
         print(f"  - 표: {len(tables)}개")
@@ -333,7 +360,7 @@ class ChunkingStrategy:
         
         # 1단계: 텍스트 청킹
         print(f"\n1️⃣ 텍스트 청킹 중...")
-        text_chunks = self.chunk_pages(text_blocks, institution)
+        text_chunks = self.chunk_pages(text_blocks, institution, source_pdf)
         print(f"  ✓ {len(text_chunks)}개 텍스트 청크 생성")
         
         # 2단계: 표 청킹 (각 표를 하나의 청크로)
